@@ -1,9 +1,11 @@
 //! MCP server main loop: reads line-delimited JSON-RPC from stdin,
 //! writes responses to stdout, logs to stderr.
 //!
-//! Step 4: `tools/call` is wired to `handlers::dispatch`. Domain errors
-//! surface as `isError: true` tool results; only an unknown tool name
-//! produces a JSON-RPC error (`-32602`).
+//! The server starts with no target loaded (or with an argv preload) and
+//! stays up for the whole MCP session. The agent loads binaries by calling
+//! `probe_open` — see `handlers::open`. Domain errors surface as
+//! `isError: true` tool results; only an unknown tool name produces a
+//! JSON-RPC error (`-32602`).
 
 use std::io::{self, BufRead, Write};
 
@@ -168,11 +170,13 @@ fn handle_initialize(req: &JsonRpcRequest, id: serde_json::Value) -> JsonRpcResp
         server_info: ServerInfo::probe(),
         instructions: Some(
             "probe-mcp: sandboxed runtime for PE32/x86 binaries. \
-             The target binary is loaded at server startup (argv[1]). \
+             The server starts with no target loaded. \
+             Call probe_open with a path to a PE32/x86 binary to load one; \
+             this can be repeated to switch targets at any time. \
              Tools: \
-             probe_list_functions, probe_inspect_function, probe_disasm, probe_peek, \
-             probe_poke, probe_alloc, probe_set_mock, probe_reset_mock, probe_invoke, \
-             probe_invoke_mock, probe_call_log, probe_call_log_clear. \
+             probe_open, probe_list_functions, probe_inspect_function, probe_disasm, \
+             probe_peek, probe_poke, probe_alloc, probe_set_mock, probe_reset_mock, \
+             probe_invoke, probe_invoke_mock, probe_call_log, probe_call_log_clear. \
              Call tools/list for full schemas."
                 .to_string(),
         ),

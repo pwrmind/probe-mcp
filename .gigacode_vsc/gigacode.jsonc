@@ -1,0 +1,9 @@
+{
+  "$schema": "https://app.tmp_not_exist_for_test.ru/config.json",
+  "mcpServers": {
+    "probe": {
+      "command": "C:\\projects\\rust\\probe-mcp\\target\\i686-pc-windows-msvc\\release\\probe-mcp.exe",
+      "args": []
+    }
+  }
+}

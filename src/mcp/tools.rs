@@ -5,8 +5,8 @@
 //! `annotations` field carries MCP safety hints so the host can decide
 //! whether to auto-approve a call or ask the user.
 //!
-//! Tool names are exposed as `pub const` so the dispatcher (step 4) can
-//! match on them without stringly-typed literals scattered around.
+//! Tool names are exposed as `pub const` so the dispatcher can match on
+//! them without stringly-typed literals scattered around.
 
 use serde_json::{json, Value};
 
@@ -16,6 +16,7 @@ use super::protocol::{Tool, ToolAnnotations};
 // Tool names
 // =========================================================================
 
+pub const OPEN: &str = "probe_open";
 pub const LIST_FUNCTIONS: &str = "probe_list_functions";
 pub const INSPECT_FUNCTION: &str = "probe_inspect_function";
 pub const DISASM: &str = "probe_disasm";
@@ -170,6 +171,10 @@ fn ann(title: &str, read_only: bool, destructive: bool, idempotent: bool) -> Too
 
 pub fn list_tools() -> Vec<Tool> {
     vec![
+        // `probe_open` is first in the list: it is the mandatory entry
+        // point for any new session and the only tool that works without
+        // a loaded target.
+        tool_open(),
         tool_list_functions(),
         tool_inspect_function(),
         tool_disasm(),
@@ -185,6 +190,45 @@ pub fn list_tools() -> Vec<Tool> {
     ]
 }
 
+// ---------- 0. open target --------------------------------------------------
+
+fn tool_open() -> Tool {
+    Tool {
+        name: OPEN.to_string(),
+        description: "Load a PE32/x86 binary for analysis. This must be the first \
+            tool called in a session. If a binary is already loaded, it is replaced: \
+            the previous target's image, mocks, and allocations are freed, and the \
+            call log is reset. \
+            The path is resolved on the server side. Absolute paths are recommended; \
+            relative paths are resolved against the server's working directory."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to a PE32/x86 binary on the local filesystem."
+                }
+            },
+            "required": ["path"]
+        }),
+        output_schema: Some(json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Canonicalized path actually loaded." },
+                "image_base": { "type": "string", "pattern": "^0x[0-9A-Fa-f]{8}$" },
+                "image_size": { "type": "integer" },
+                "entry_point": { "type": "string", "pattern": "^0x[0-9A-Fa-f]{8}$" },
+                "functions_count": { "type": "integer" },
+                "exports_count": { "type": "integer" },
+                "mocks_count": { "type": "integer" }
+            },
+            "required": ["path", "image_base", "image_size", "functions_count"]
+        })),
+        annotations: Some(ann("Open target binary", false, false, false)),
+    }
+}
+
 // ---------- 1. list functions -----------------------------------------------
 
 fn tool_list_functions() -> Tool {
@@ -192,8 +236,9 @@ fn tool_list_functions() -> Tool {
         name: LIST_FUNCTIONS.to_string(),
         description: "List functions discovered in the loaded PE32 binary. \
             Returns address, name (or '-' for unnamed internal), size, direct-call count, \
-            and calling convention. Use this as the first step of reconnaissance. \
-            Filters and sorting are server-side, so prefer them over fetching the full list."
+            and calling convention. Use this as the first step of reconnaissance after \
+            probe_open. Filters and sorting are server-side, so prefer them over fetching \
+            the full list."
             .to_string(),
         input_schema: json!({
             "type": "object",

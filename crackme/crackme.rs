@@ -512,33 +512,60 @@ pub extern "C" fn protected_operation() -> i32 {
 // достижима от неё. Остальные 17 — выкидывались.
 //
 // `#[used]` на этом статике запрещает линкеру его удалить. Каждый
-// элемент — адрес соответствующей функции; `foo as usize` порождает
-// релокацию, и линкер обязан сохранить каждую функцию, чтобы релокация
-// резолвилась. Результат: `dumpbin /exports` показывает 22 символа.
+// элемент — адрес соответствующей функции; релокация заставляет
+// линкер сохранить каждую функцию, чтобы она резолвилась. Результат:
+// `dumpbin /exports` показывает 22 символа.
+//
+// Почему newtype `KeepPtr`, а не голый `*const ()`:
+//
+//   `static` требует `T: Sync`. `*const ()` не реализует `Sync`,
+//   поэтому попытка `static _CRACKME_KEEP: [*const (); 22]` даёт:
+//       error[E0277]: `*const ()` cannot be shared between threads safely
+//
+//   `KeepPtr` — `#[repr(transparent)]` обёртка с ручным
+//   `unsafe impl Sync`. Это корректно: статик никогда не читается и
+//   не разыменовывается в рантайме, он существует исключительно как
+//   якорь для `#[used]` и релокаций линкера. Побайтовое представление
+//   остаётся тем же `*const ()`, релокация генерируется та же, и
+//   линкер по-прежнему обязан сохранить все 22 функции.
+//
+// Почему `fn as *const ()` работает, а `fn as usize` — нет:
+//
+//   `foo as usize` в const-контексте требует конкретного числового
+//   значения, которое неизвестно до линковки. Rust отказывает:
+//       error: pointers cannot be cast to integers during const eval
+//
+//   `foo as *const ()` — каст между двумя указательными типами.
+//   В const-eval достаточно сохранить провенанс (аллокацию), конкретное
+//   число не требуется — релокация доделает всё на линковке.
+
+#[repr(transparent)]
+struct KeepPtr(*const ());
+unsafe impl Sync for KeepPtr {}
 
 #[used]
 #[allow(non_upper_case_globals)]
-static _CRACKME_KEEP: [usize; 22] = [
-    is_admin as usize,
-    check_password as usize,
-    login as usize,
-    fill as usize,
-    copy_upper as usize,
-    __loop_marker as usize,
-    verify_serial_timing as usize,
-    check_hardware_id as usize,
-    check_network_token as usize,
-    check_subscription_status as usize,
-    validate_premium_user as usize,
-    derive_session_key as usize,
-    verify_license as usize,
-    parse_user_bio as usize,
-    process_custom_packet as usize,
-    decrypt_inplace as usize,
-    check_obfuscated_password as usize,
-    crash_div as usize,
-    crash_illegal_instruction as usize,
-    crash_null_deref as usize,
-    detect_debugger as usize,
-    protected_operation as usize,
+static _CRACKME_KEEP: [KeepPtr; 22] = [
+    KeepPtr(is_admin                     as *const ()),
+    KeepPtr(check_password               as *const ()),
+    KeepPtr(login                        as *const ()),
+    KeepPtr(fill                         as *const ()),
+    KeepPtr(copy_upper                   as *const ()),
+    KeepPtr(__loop_marker                as *const ()),
+    KeepPtr(verify_serial_timing         as *const ()),
+    KeepPtr(check_hardware_id            as *const ()),
+    KeepPtr(check_network_token          as *const ()),
+    KeepPtr(check_subscription_status    as *const ()),
+    KeepPtr(validate_premium_user        as *const ()),
+    KeepPtr(derive_session_key           as *const ()),
+    KeepPtr(verify_license               as *const ()),
+    KeepPtr(parse_user_bio               as *const ()),
+    KeepPtr(process_custom_packet        as *const ()),
+    KeepPtr(decrypt_inplace              as *const ()),
+    KeepPtr(check_obfuscated_password    as *const ()),
+    KeepPtr(crash_div                    as *const ()),
+    KeepPtr(crash_illegal_instruction    as *const ()),
+    KeepPtr(crash_null_deref             as *const ()),
+    KeepPtr(detect_debugger              as *const ()),
+    KeepPtr(protected_operation          as *const ()),
 ];

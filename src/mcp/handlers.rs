@@ -1,10 +1,12 @@
 //! Tool handlers — one function per MCP tool.
 //!
-//! Step 5 (final): all 12 tools are wired up. Each handler produces a
-//! `CallToolResult` (success or tool-error). Only `dispatch` returns a
-//! `McpError`, and only for an unknown tool name — every domain error
-//! (missing function, unreadable memory, invalid argument value) is
-//! surfaced as `isError: true` so the LLM can reason about it and retry.
+//! `probe_open` loads a target into the sandbox; every other tool requires
+//! that a target has been loaded and returns a clear tool-error otherwise.
+//! Each handler produces a `CallToolResult` (success or tool-error). Only
+//! `dispatch` returns a `McpError`, and only for an unknown tool name —
+//! every domain error (missing function, unreadable memory, invalid
+//! argument value) is surfaced as `isError: true` so the LLM can reason
+//! about it and retry.
 //!
 //! A sandbox crash is NOT an error: `probe_invoke` succeeds and reports
 //! the crash in `structuredContent.crash`.
@@ -37,7 +39,18 @@ pub fn dispatch(
     let null = Value::Null;
     let args: &Value = arguments.unwrap_or(&null);
 
+    // probe_open is the only tool that works on an unloaded context.
+    // Every other *known* tool must reject with a clear message until a
+    // target has been loaded via probe_open. Unknown tool names fall
+    // through to `McpError::invalid_params` below.
+    if name != tools::OPEN && !ctx.is_loaded && is_known_tool(name) {
+        return Ok(CallToolResult::tool_error(
+            "no target loaded: call probe_open with a path to a PE32/x86 binary first",
+        ));
+    }
+
     let result = match name {
+        tools::OPEN => open(ctx, args),
         tools::LIST_FUNCTIONS => list_functions(ctx, args),
         tools::INSPECT_FUNCTION => inspect_function(ctx, args),
         tools::DISASM => disasm(ctx, args),
@@ -62,6 +75,25 @@ pub fn dispatch(
         Ok(r) => r,
         Err(e) => CallToolResult::tool_error(e),
     })
+}
+
+fn is_known_tool(name: &str) -> bool {
+    matches!(
+        name,
+        tools::OPEN
+            | tools::LIST_FUNCTIONS
+            | tools::INSPECT_FUNCTION
+            | tools::DISASM
+            | tools::PEEK
+            | tools::POKE
+            | tools::ALLOC
+            | tools::SET_MOCK
+            | tools::RESET_MOCK
+            | tools::INVOKE
+            | tools::INVOKE_MOCK
+            | tools::CALL_LOG
+            | tools::CALL_LOG_CLEAR
+    )
 }
 
 // =========================================================================
@@ -132,6 +164,98 @@ fn name_or_dash(ctx: &SandboxContext, addr: u32) -> String {
     ctx.name_of(addr)
         .cloned()
         .unwrap_or_else(|| "-".to_string())
+}
+
+/// Strip the Windows extended-length prefix `\\?\` that `canonicalize`
+/// adds. The result is a "pretty" path suitable for display to the LLM
+/// and for direct string comparison against user-supplied paths.
+///
+/// Cases handled:
+///   `\\?\C:\projects\foo.dll`         → `C:\projects\foo.dll`
+///   `\\?\UNC\server\share\foo.dll`    → `\\server\share\foo.dll`
+///   anything else                     → unchanged
+///
+/// The stripped path is used for *display only*; the original
+/// `canonicalize` output is still what we hand to `pe_loader`. This means
+/// we don't lose the >260-char path capability, we just don't print the
+/// `\\?\` noise.
+fn display_path(p: &std::path::Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        // Local absolute path: `\\?\C:\...` → `C:\...`
+        if rest.len() >= 2 && rest.as_bytes().get(1) == Some(&b':') {
+            return std::path::PathBuf::from(rest);
+        }
+        // UNC path: `\\?\UNC\server\share\...` → `\\server\share\...`
+        if let Some(unc_rest) = rest.strip_prefix(r"UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{}", unc_rest));
+        }
+    }
+    p.to_path_buf()
+}
+
+// =========================================================================
+// 0. probe_open
+// =========================================================================
+
+fn open(ctx: &mut SandboxContext, args: &Value) -> Result<CallToolResult, String> {
+    let o = obj(args, "probe_open")?;
+    let path_str = get_str(o, "path", "probe_open")?;
+
+    // Resolve the path. Relative paths are resolved against the server's
+    // current working directory. `canonicalize` also gives a clear error
+    // if the file doesn't exist.
+    let raw_path = std::path::Path::new(path_str);
+    let canonical = std::fs::canonicalize(raw_path).map_err(|e| {
+        format!(
+            "probe_open: cannot resolve '{}': {}",
+            path_str, e
+        )
+    })?;
+
+    if !canonical.is_file() {
+        return Err(format!(
+            "probe_open: '{}' is not a regular file",
+            canonical.display()
+        ));
+    }
+
+    // Windows `canonicalize` returns `\\?\C:\...`. That form is correct
+    // but noisy in JSON responses (each backslash doubles in escaping)
+    // and breaks naive string comparison against user-supplied paths.
+    // We use the canonical form for the actual load (so symlinks and
+    // >260-char paths still work) and the "pretty" form only for display.
+    let pretty = display_path(&canonical);
+
+    let new_ctx = crate::pe_loader::load_and_analyze(&canonical)?;
+
+    let summary = format!(
+        "loaded {} ({} bytes) at {}; {} function(s), {} export(s), {} mock(s); entry = {}",
+        pretty.display(),
+        new_ctx.image_size,
+        format_address(new_ctx.image_base),
+        new_ctx.functions.len(),
+        new_ctx.export_names.len(),
+        new_ctx.mocks.len(),
+        format_address(new_ctx.entry_point),
+    );
+
+    let structured = json!({
+        "path": pretty.to_string_lossy(),
+        "image_base": format_address(new_ctx.image_base),
+        "image_size": new_ctx.image_size,
+        "entry_point": format_address(new_ctx.entry_point),
+        "functions_count": new_ctx.functions.len(),
+        "exports_count": new_ctx.export_names.len(),
+        "mocks_count": new_ctx.mocks.len(),
+    });
+
+    // Replace the active context. The old value is dropped here, freeing
+    // its PE image, mocks, and probe_alloc'd buffers (see
+    // `SandboxContext::drop` in context.rs).
+    *ctx = new_ctx;
+
+    Ok(CallToolResult::ok(summary, structured))
 }
 
 // =========================================================================

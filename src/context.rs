@@ -69,9 +69,8 @@ pub struct SandboxContext {
     pub image_base: u32,
     pub image_size: usize,
     pub entry_point: u32,
-    /// Vestigial field from the REPL version. The MCP server refuses to
-    /// start without a target, so every reachable context is loaded.
-    #[allow(dead_code)]
+    /// `false` until `probe_open` (or the argv pre-load path) succeeds.
+    /// Every other tool rejects with a clear tool-error while this is `false`.
     pub is_loaded: bool,
     pub functions: HashMap<u32, FunctionMeta>,
     pub mocks: HashMap<u32, Mock>,
@@ -81,10 +80,9 @@ pub struct SandboxContext {
 }
 
 impl SandboxContext {
-    /// Vestigial: only the REPL's `no-target>` prompt mode used this.
-    /// Kept so the type remains usable in unit tests that want an
-    /// empty context without loading a PE.
-    #[allow(dead_code)]
+    /// A context with no target loaded. The server starts in this state
+    /// when invoked without `argv[1]`; the agent is expected to call
+    /// `probe_open` before any other tool.
     pub fn empty() -> Self {
         Self {
             file_path: PathBuf::new(),
@@ -112,6 +110,36 @@ impl SandboxContext {
                 .iter()
                 .find(|(_, v)| v.as_str() == n.as_str())
                 .map(|(k, _)| *k),
+        }
+    }
+}
+
+/// `probe_open` replaces the active context with `*ctx = new_ctx`. The old
+/// value is dropped here, which reclaims:
+///
+///   - every mock stub (each `Mock` has its own `Drop` doing `VirtualFree`),
+///   - every buffer allocated via `probe_alloc`,
+///   - the mapped PE image itself (`VirtualAlloc`'d at a fixed base).
+///
+/// If the context was created via `empty()` (image_base == 0, no
+/// allocations), all three branches are no-ops.
+///
+/// Safety: at `Drop` time the executor is guaranteed idle — `probe_invoke`
+/// is synchronous and joins its worker thread before returning, so no
+/// thread is executing code inside the image being freed.
+impl Drop for SandboxContext {
+    fn drop(&mut self) {
+        unsafe {
+            // Free allocations made by probe_alloc.
+            for (&addr, _size) in self.allocated.iter() {
+                ffi::VirtualFree(addr as *mut _, 0, ffi::MEM_RELEASE);
+            }
+            // Free the mapped PE image.
+            if self.image_base != 0 && self.image_size != 0 {
+                ffi::VirtualFree(self.image_base as *mut _, 0, ffi::MEM_RELEASE);
+            }
+            // Mocks are freed by `Mock::drop` when `self.mocks` is dropped
+            // immediately after this `Drop::drop` returns; nothing to do here.
         }
     }
 }
